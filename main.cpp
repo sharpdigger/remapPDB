@@ -21,17 +21,48 @@ ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDI
 NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
 ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
+
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #define NOGDI
 
+#include <windows.h>
 #include <stdio.h>
 #include <io.h>
 #include <Windows.h>
 #include <DbgHelp.h>
+#include <string>
+#include <vector>
+#include <tchar.h>
+
+using namespace std;
+
+struct FixHeader 
+{
+	string module;
+	IMAGE_OPTIONAL_HEADER imageHeader;
+	ULONG32 timeStamp;
+};
+
+static string wstr2mbcs(const wstring& str)
+{
+	unsigned codePage = GetOEMCP();
+
+	unsigned newLength = WideCharToMultiByte(
+		codePage, 0, str.c_str(), -1, 
+		NULL, 0, NULL, NULL) - 1;
+
+	string mbcs;
+	mbcs.resize(newLength);
+
+	WideCharToMultiByte(codePage, 0, str.c_str(), -1, 
+		(LPSTR)mbcs.c_str(), newLength + 1, NULL, NULL);
+
+	return mbcs;
+}
 
 
-static bool getExecutableChecksumAndSize( const char* _path, ULONG32* _timeStamp, IMAGE_OPTIONAL_HEADER* _header )
+static bool getExecutableChecksumAndSize(const char* _path, ULONG32* _timeStamp, IMAGE_OPTIONAL_HEADER* _header)
 {
 	FILE* fp = fopen(_path, "rb");
 	if (!fp)
@@ -69,7 +100,18 @@ static bool getExecutableChecksumAndSize( const char* _path, ULONG32* _timeStamp
 }
 
 
-static bool fixupDump( const char* _dumpPath, ULONG32 _timeStamp, const IMAGE_OPTIONAL_HEADER* _header, const char* _executablePath )
+static bool getRvaString(RVA rva, const char* mem, wstring* str)
+{
+	const MINIDUMP_STRING* mstr = (const MINIDUMP_STRING*)(mem + rva);
+	if (IsBadReadPtr(mstr->Buffer, mstr->Length) != FALSE)
+		return false;
+
+	str->resize(mstr->Length / 2);
+	memcpy(&((*str)[0]), mstr->Buffer, mstr->Length);
+	return true;
+}
+
+static bool fixupDump(const char* _dumpPath, const vector<FixHeader>& headers)
 {
 	FILE* fp = fopen(_dumpPath, "rb");
 	if (!fp)
@@ -88,7 +130,6 @@ static bool fixupDump( const char* _dumpPath, ULONG32 _timeStamp, const IMAGE_OP
 		return false;
 	}
 
-
 	MINIDUMP_DIRECTORY* directory = (MINIDUMP_DIRECTORY*)(data + header->StreamDirectoryRva);
 	for (int ii = 0; ii < (int)header->NumberOfStreams; ++ii)
 	{
@@ -96,11 +137,28 @@ static bool fixupDump( const char* _dumpPath, ULONG32 _timeStamp, const IMAGE_OP
 		{
 			MINIDUMP_MODULE_LIST* moduleList = (MINIDUMP_MODULE_LIST*)(data + directory[ii].Location.Rva);
 
-			MINIDUMP_MODULE* module = &moduleList->Modules[0];
-			module->ModuleNameRva = fileSize;
-			module->CheckSum = _header->CheckSum;
-			module->SizeOfImage = _header->SizeOfImage;
-			module->TimeDateStamp = _timeStamp;
+			for (size_t i = 0; i < moduleList->NumberOfModules; i++)
+			{
+				MINIDUMP_MODULE* module = &moduleList->Modules[i];
+				wstring moduleNameWide;
+				getRvaString(module->ModuleNameRva, data, &moduleNameWide);
+
+				string moduleName = wstr2mbcs(moduleNameWide);
+
+				for (size_t j = 0; j < headers.size(); j++)
+				{
+					const FixHeader& header = headers[j];
+					if (moduleName.find(header.module) != string::npos)
+					{
+						module->CheckSum = header.imageHeader.CheckSum;
+						module->SizeOfImage = header.imageHeader.SizeOfImage;
+						module->TimeDateStamp = header.timeStamp;
+
+						printf("Fixed module %s\n", moduleName.c_str());
+						continue;
+					}
+				}
+			}
 		}
 	}
 
@@ -112,34 +170,29 @@ static bool fixupDump( const char* _dumpPath, ULONG32 _timeStamp, const IMAGE_OP
 	}
 
 	fwrite(data, fileSize, 1, fp);
-
-	wchar_t fullPath[MAX_PATH];
-	GetCurrentDirectoryW(MAX_PATH, fullPath);
-	wcscat(fullPath, L"\\");
-	ULONG32 newSize = strlen(_executablePath) * sizeof(wchar_t) + wcslen(fullPath);
-	fwrite(&newSize, sizeof(newSize), 1, fp);
-	fwprintf(fp, L"%s%S", fullPath, _executablePath);
-	fputc(0, fp);
 	fclose(fp);
 
 	delete[] data;
 	return true;
 }
 
-static void cleanupDump( const char* _path )
+static void cleanupDump(const char* _path)
 {
 	FILE* fp = fopen(_path, "rb");
+	if (!fp)
+		return;
+
 	const long fileSize = _filelength(_fileno(fp));
 	char* data = new char[fileSize];
 	fread(data, fileSize, 1, fp);
 	fclose(fp);
-
 
 	MINIDUMP_HEADER* header = (MINIDUMP_HEADER*)data;
 	const bool signatureMatches = (header->Signature == MINIDUMP_SIGNATURE);
 	if (signatureMatches)
 	{
 		delete[] data;
+		fclose(fp);
 		return;
 	}
 
@@ -147,6 +200,7 @@ static void cleanupDump( const char* _path )
 	if (header->Signature != MINIDUMP_SIGNATURE)
 	{
 		delete[] data;
+		fclose(fp);
 		return;
 	}
 
@@ -158,44 +212,48 @@ static void cleanupDump( const char* _path )
 
 int main( int argc, char** argv )
 {
-	if (argc != 2)
+	if (argc < 3)
 	{
-		fprintf(stderr, "Usage: %s <exe filename>\n", argv[0]);
+		fprintf(stderr, "Usage: %s <dump file> <module1> <module2> <module3> ...\n", argv[0]);
 		return -1;
 	}
 
-	const char* executable = argv[1];
+	const char* dumpFile = argv[1];
 
-	// Find the checksum for the executable
-	IMAGE_OPTIONAL_HEADER header;
-	ULONG32 timeStamp;
-	if (!getExecutableChecksumAndSize(executable, &timeStamp, &header))
-	{
-		fprintf(stderr, "Failed to lookup checksum for exe '%s'\n", executable);
-		return -1;
-	}
+	vector<IMAGE_OPTIONAL_HEADER> headers;
+	vector<ULONG32> timeStamps;
 
-	// Fixup every .dmp file
-	WIN32_FIND_DATAA findData;
-	HANDLE handle = FindFirstFileA("*.dmp", &findData);
-	if (handle != INVALID_HANDLE_VALUE)
+	vector<FixHeader> fixHeaders;
+	
+	for (size_t i = 2; i < argc; i++)
 	{
-		do
+		const char* module = argv[i];
+		IMAGE_OPTIONAL_HEADER header;
+		ULONG32 timeStamp;
+
+		printf("Looking up checksum and size for module %s\n", module);
+
+		if (!getExecutableChecksumAndSize(module, &timeStamp, &header))
 		{
-			cleanupDump(findData.cFileName);
-			bool success = fixupDump(findData.cFileName, timeStamp, &header, executable);
-			if (success)
-			{
-				printf("Remapped %s to %s\n", findData.cFileName, executable);
-			}
-			else
-			{
-				printf("** Failed to remap %s\n", findData.cFileName);
-			}
-		} while (FindNextFileA(handle, &findData));
+			fprintf(stderr, "Failed to lookup checksum for module '%s'\n", module);
+			continue;
+		}
 
-		FindClose(handle);
+		FixHeader fixHeader;
+		fixHeader.module = module;
+		fixHeader.imageHeader = header;
+		fixHeader.timeStamp = timeStamp;
+		
+		fixHeaders.push_back(fixHeader);
 	}
+
+	cleanupDump(dumpFile);
+
+	bool success = fixupDump(dumpFile, fixHeaders);
+	if (success)
+		printf("Fixed!\n");
+	else
+		printf("** Fixing failed\n");
 
 	return 0;
 }
